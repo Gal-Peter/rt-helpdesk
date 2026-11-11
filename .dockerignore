@@ -1,0 +1,67 @@
+# Build-context filter for BOTH targets (runtime and test).
+# tests/, pytest.ini and requirements-dev.txt are deliberately NOT excluded:
+# the test target needs them. app/schema.sql is also needed, so *.sql is not excluded.
+
+# Git history and editor files
+.git
+.gitignore
+.gitattributes
+.github
+.vscode
+.idea
+**/*.swp
+**/*.swo
+**/*~
+**/.DS_Store
+**/Thumbs.db
+
+# Local environment files and credentials (keep .env.example out too)
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/id_rsa*
+**/id_ed25519*
+**/*.kubeconfig
+**/kubeconfig
+**/.kube
+
+# Python virtualenvs, bytecode, test caches and results
+.venv
+**/.venv
+venv
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+**/.pytest_cache
+test-results
+.coverage
+htmlcov
+
+# Database backups/dumps and logs
+backups
+**/*.dump
+**/*.bak
+**/*.log
+
+# Terraform working dirs, state, plans and local variable files
+**/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+**/*.plan
+**/terraform.tfvars
+**/*.auto.tfvars
+**/backend.hcl
+
+# Folders and files not needed by either image
+docs
+reference
+monitoring
+postgres
+scripts
+compose.yaml
+README.md
