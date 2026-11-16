@@ -50,3 +50,29 @@ jobs:
         with:
           name: test-results
           path: test-results/results.xml
+  terraform:
+    name: Terraform fmt and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [terraform/bootstrap, terraform/lab]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.6"
+          terraform_wrapper: false
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+        working-directory: ${{ matrix.dir }}
+      # Backend access is disabled: validation needs no AWS credentials or state.
+      - name: Initialize without backend
+        run: terraform init -backend=false -input=false
+        working-directory: ${{ matrix.dir }}
+      - name: Validate
+        run: terraform validate
+        working-directory: ${{ matrix.dir }}
