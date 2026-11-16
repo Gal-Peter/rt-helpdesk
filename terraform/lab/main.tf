@@ -137,6 +137,9 @@ resource "aws_budgets_budget" "lab" {
   limit_amount = tostring(var.monthly_budget_usd)
   limit_unit   = "USD"
   time_unit    = "MONTHLY"
+  cost_types {
+    include_credit = false
+  }
   notification {
     comparison_operator        = "GREATER_THAN"
     threshold                  = 80
