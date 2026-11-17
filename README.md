@@ -4,7 +4,7 @@ Individual DevOps final project: deploy and operate the supplied RT Helpdesk (Fl
 
 The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_README.md).
 
-**Status:** Milestones 1-2 done (the deliberate failing-test CI exercise for Milestone 1 is still to do). Milestones 3-5 are placeholders.
+**Status:** Milestones 1-2 done. Milestones 3-5 are placeholders.
 
 ## Contents
 
@@ -109,8 +109,8 @@ Note for Windows and Git Bash: commands containing Linux paths like `/tmp` need 
 | App CI #1 (push to `main`) | **Failed** at "Build runtime image": `open Dockerfile: no such file or directory`. Tests passed; `main` had no Dockerfile yet | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43119547749) |
 | App CI #2 (PR #1) | Passed after adding the Dockerfile and `.dockerignore` | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43121318752) |
 | App CI #3 (merge to `main`) | Passed | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43122323070) |
-| My own deliberately failing test (no fixture was supplied): CI fails | _todo_ | _add link_ |
-| Failing test fixed or removed: CI passes | _todo_ | _add link_ |
+| My own deliberately failing test (no fixture was supplied): CI fails, merge blocked | PR #5, first commit | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43987294930) |
+| Failing test removed: CI passes, merge unlocked | PR #5, second commit | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43988471574) |
 
 Pull requests so far (each self-reviewed with a checklist and merged only after green checks):
 
