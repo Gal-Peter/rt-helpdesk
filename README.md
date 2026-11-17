@@ -1,142 +1,236 @@
-# RT Helpdesk DevOps final project
+# RT Helpdesk on AWS: DevOps final project
 
-A supplied Flask + PostgreSQL application for Real Time College. Students operate and deploy this app. **No Python, frontend or business-logic coding is required.**
+Individual DevOps final project: deploy and operate the supplied RT Helpdesk (Flask + PostgreSQL) on AWS with Docker, Terraform, Kubernetes (kind), Jenkins, Prometheus and Grafana.
 
-Read [the final project assignment](docs/FINAL_PROJECT.md) first. It covers AWS, Terraform, Kubernetes, Docker, Jenkins, Git, GitHub Actions, Linux, Prometheus and Grafana.
+The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_README.md).
 
-## What is included
+**Status:** Milestones 1-2 done (the deliberate failing-test CI exercise for Milestone 1 is still to do). Milestones 3-5 are placeholders.
 
-| Included and ready to use | Built by students during the project |
+## Contents
+
+1. [Architecture](#architecture)
+2. [Ports and access](#ports-and-access)
+3. [Milestone 1: Container packaging, Git and CI](#milestone-1-container-packaging-git-and-ci)
+4. [Milestone 2: AWS with Terraform](#milestone-2-aws-with-terraform)
+5. [Milestone 3: Linux and Kubernetes](#milestone-3-linux-and-kubernetes) (todo)
+6. [Milestone 4: Jenkins release and rollback](#milestone-4-jenkins-release-and-rollback) (todo)
+7. [Milestone 5: Monitoring and restore](#milestone-5-monitoring-and-restore) (todo)
+8. [Cleanup and teardown](#cleanup-and-teardown)
+9. [Problems met and how they were solved](#problems-met-and-how-they-were-solved)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    me["My PC<br/>(admin IP only)"] -- "SSH 22" --> ci
+    me -- "SSH 22" --> app
+    subgraph AWS["AWS eu-north-1: one VPC 10.42.0.0/16, one public subnet"]
+        ci["CI host (t3.micro)<br/>Jenkins controller + agent<br/>(Milestone 4)"]
+        app["App host (t3.small)<br/>kind cluster: helpdesk + monitoring<br/>(Milestones 3 and 5)"]
+        ci -- "SSH 22 (private IP)" --> app
+        app -- "instance role" --> backup[("S3 backup bucket<br/>gp-hd-backup-1126")]
+    end
+    state[("S3 state bucket<br/>gp-hd-tform-state-1126")] -. "Terraform state" .- me
+```
+
+Built so far: everything in the diagram except what runs on the hosts (Milestones 3-5).
+
+**Known limits.** One app host and one database mean there is no high availability. The kind cluster uses local volumes, which are lost if the cluster (or host) is deleted. Recovery therefore relies on the S3 backups. No load balancer, domain, HTTPS, EKS, RDS or NAT gateway is used, by design (cost and scope).
+
+## Ports and access
+
+| What | Where | Who can reach it |
+|---|---|---|
+| SSH to CI host | port 22 | my admin IP only (`admin_cidr`) |
+| SSH to app host | port 22 | my admin IP, and the CI host's security group |
+| Helpdesk UI and API (local Compose) | http://localhost:8000 | my PC only (bound to 127.0.0.1) |
+| Prometheus / Grafana (local Compose profile) | localhost:9090 / localhost:3000 | my PC only |
+| App, Grafana, Prometheus on AWS | Milestones 3 and 5 | SSH tunnel and `kubectl port-forward` only; no public ports |
+
+My admin IP changes sometimes. If SSH stops working, update `admin_cidr` and run `terraform apply`.
+
+## Milestone 1: Container packaging, Git and CI
+
+### Dockerfile
+
+Three named stages in one `Dockerfile`:
+
+| Stage | Purpose |
 |---|---|
-| Flask API, browser UI and PostgreSQL schema | AWS infrastructure in Terraform |
-| Five fictional tickets and automated tests | Linux server configuration and automation |
-| Container packaging brief and local Compose environment | Dockerfile, .dockerignore and container verification |
-| Kubernetes and database initialization examples | Kubernetes manifests and environment configuration |
-| Example GitHub Actions checks | Jenkins release and deployment pipeline |
-| App metrics, Prometheus rules and Grafana dashboard | Kubernetes monitoring deployment and failure evidence |
-| Local and Kubernetes backup helpers | One S3 backup and a verified restore |
+| `base` | `python:3.12-slim-bookworm`, creates user/group 10001, installs `requirements.txt`, then copies `app/` and `gunicorn.conf.py` |
+| `test` | Extends `base`, adds `requirements-dev.txt`, `pytest.ini` and `tests/`; default command runs pytest; final user is 10001:10001 |
+| `runtime` | Extends `base`; sets `APP_VERSION`, `USER 10001:10001`, `EXPOSE 8000`, starts Gunicorn |
 
-This is an individual project targeting 70-90 hours, with one application namespace (`helpdesk`) plus monitoring. Bash/cloud-init cover server setup; Ansible is not required. The [reference solution and setup guide](reference/README.md) supply templates for the supported beginner path. Students use their own AWS accounts and available AWS credits, configure their own budgets, Jenkins agents and deployment credentials, connect the pipeline and verify each required outcome. The instructor supplies tested templates and guidance. The schedule allocates 74 planned hours plus up to 16 troubleshooting hours. The package has not been deployed to an AWS account.
+`runtime` is the **last** stage, so `docker build` without `--target` produces the web image. `test` extends `base`, not `runtime`, so it is never the default result. Compose, GitHub Actions and Jenkins refer to `runtime` by name.
 
-## Complete container packaging first
+**Dependency caching.** `requirements.txt` is copied and installed before `app/` is copied. A source-only change (for example a CSS edit) reruns only the `COPY app/` layers. I checked this: after adding a CSS comment the `pip install` layer showed `CACHED`.
 
-This is the student package. `Dockerfile` and `.dockerignore` are intentionally absent. Follow [CONTAINER_PACKAGING.md](docs/CONTAINER_PACKAGING.md) to create them. It supplies the exact Python commands, required files, stage names, runtime settings and verification steps. No Python changes are needed. Allow 3-4 hours within the existing first-week budget.
+**Non-root user.** The image runs as UID/GID 10001 (`app`), with `nologin` and no home directory. Application files are owned by root and are read-only to that user. Verified with `id` inside the container and `docker image inspect` (`10001:10001`).
 
-Compose startup and the CI image-build step will fail until the Dockerfile is complete. The finished Docker files are in a separate instructor package.
+**Writable `/tmp` and read-only root.** The app only needs `/tmp` (Gunicorn's `worker_tmp_dir`). Compose runs it with `read_only: true` and a `tmpfs` on `/tmp`. I verified that `touch /tmp/...` works with `docker run --read-only --tmpfs /tmp`.
 
-## Start locally
+**Runtime secrets.** No credentials are in build arguments, the Dockerfile or image layers. Database settings come from environment variables supplied by Compose from a generated `.env` (git-ignored and Docker-ignored). The only build argument is `APP_VERSION`, which is not a secret. Release images will use the commit SHA.
 
-After completing the packaging assignment, use the following steps.
+**Ports and data.** The app listens on 8000 inside the container (`EXPOSE 8000`); Compose publishes it on `127.0.0.1:8000`. The image holds no data. Tickets live in PostgreSQL's named volume `pgdata`, which survives `docker compose restart` and `down` (not `down -v`).
 
-Requirements: Docker Engine or Docker Desktop with Compose v2, Git, and Python 3.10+ for the helper scripts. Docker Desktop on Windows should use Linux containers. Run all commands from this folder. On Windows, use `py` if `python` is not available.
+**Why tests stay in the build context but out of the runtime image.** `.dockerignore` filters the context for both targets, and the test target needs `tests/`, `pytest.ini` and `requirements-dev.txt`, so they cannot be ignored. The runtime image stays clean because its stage never copies them. Verified: `pip show pytest` fails in the runtime image.
 
-```sh
-python scripts/setup_env.py
-docker compose up --build -d
-docker compose exec api flask --app app seed-db
-```
+### .dockerignore
 
-Open **http://localhost:8000**. Create a ticket and close or reopen it. No login is needed in this lab.
+Excludes Git history and editor files, `.env*`, keys and kubeconfigs, virtualenvs, bytecode and test caches, backups, dumps and logs, Terraform state/plans/variable files, and folders neither image needs (`docs/`, `reference/`, `monitoring/`, `postgres/`, `scripts/`). It deliberately keeps `tests/`, `pytest.ini`, `requirements-dev.txt` and `app/schema.sql`. Patterns use `**/` so subfolders are covered. The build context dropped to about 20 kB.
 
-The setup script generates three random passwords in `.env`. It will not overwrite an existing file. Do not commit `.env`. PostgreSQL is reachable only inside the Compose network, and web ports bind to localhost. Use fictional data. Public access and user authentication are outside this lab's default setup.
+### Local verification results
 
-Initial startup creates the non-superuser `helpdesk_app` role, its schema, and the tickets table. The `migrate` service is a one-shot initialization step. It must finish successfully before the API starts. API restarts do not clear tickets or recreate the schema.
+| Check | Command | Result |
+|---|---|---|
+| Three builds | `docker build --target runtime ...`, `--target test ...`, plain build | All succeeded |
+| Default command | `docker image inspect ... .Config.Cmd` | `["gunicorn","--config","gunicorn.conf.py","app:create_app()"]` |
+| Non-root | `docker image inspect ... .Config.User` | `10001:10001` |
+| Read-only run | `docker run --read-only --tmpfs /tmp ... touch /tmp/...` | Succeeded; `/app` has only `app`, `gunicorn.conf.py`, `requirements.txt` |
+| Runtime has no pytest | `pip show pytest` in runtime image | "Package(s) not found" |
+| Baked version | `printenv APP_VERSION` | `packaging-check` |
+| Layer caching | CSS change, rebuild | `pip install` layer `CACHED` |
+| Compose startup | `docker compose up --build -d` | `db` and `api` healthy; `migrate` exited 0 |
+| Tests | `docker compose --profile test run --build --rm tests` | **36 passed**, none skipped |
+| Persistence | Create a ticket, `docker compose restart api db` | Ticket still present afterwards |
 
-Useful commands:
+Note for Windows and Git Bash: commands containing Linux paths like `/tmp` need `MSYS_NO_PATHCONV=1` in front, or Git Bash rewrites them. In PowerShell 5.1, Terraform options containing a dot must be quoted (`"-out=lab.plan"`).
 
-```sh
-docker compose ps -a
-docker compose logs --tail 100 api migrate db
-docker compose restart api
-docker compose down
-```
+### Git and CI
 
-`docker compose down` keeps the data volume. `docker compose down -v` deletes volumes and their contents; use it only when you intentionally want a fresh lab. Changing passwords in `.env` does not change passwords in an existing PostgreSQL volume. Keep the original passwords, rotate them in PostgreSQL, or reset an expendable lab volume.
+- Repository: https://github.com/Gal-Peter/rt-helpdesk (public). `.gitignore` excludes `.env`, keys, Terraform state and plans, `terraform.tfvars`, `backend.hcl`, kubeconfigs and backups.
+- Workflow `.github/workflows/ci.yml` runs on pull requests, on pushes to `main` and manually.
+  - **Tests job:** PostgreSQL service, all tests, builds the runtime image without pushing it, and uploads `test-results` even when a later step fails.
+  - **Terraform job:** `terraform fmt -check`, `terraform init -backend=false` and `terraform validate` for `terraform/bootstrap` and `terraform/lab`. The backend is disabled so PR jobs need no AWS credentials.
+- Required checks: enforced by a repository ruleset on `main`: a pull request is required, and the 3 CI checks (tests, Terraform bootstrap, Terraform lab) must pass before merging. Force pushes are blocked. Approvals are set to 0 because this is an individual project.
 
-## Add Prometheus and Grafana
+| Run | What happened | Link |
+|---|---|---|
+| App CI #1 (push to `main`) | **Failed** at "Build runtime image": `open Dockerfile: no such file or directory`. Tests passed; `main` had no Dockerfile yet | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43119547749) |
+| App CI #2 (PR #1) | Passed after adding the Dockerfile and `.dockerignore` | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43121318752) |
+| App CI #3 (merge to `main`) | Passed | [run](https://github.com/Gal-Peter/rt-helpdesk/actions/runs/43122323070) |
+| My own deliberately failing test (no fixture was supplied): CI fails | _todo_ | _add link_ |
+| Failing test fixed or removed: CI passes | _todo_ | _add link_ |
 
-```sh
-docker compose --profile monitoring up --build -d
-python scripts/traffic.py --seconds 180
-```
+Pull requests so far (each self-reviewed with a checklist and merged only after green checks):
 
-| Service | Local address |
+1. #1 Dockerfile and `.dockerignore`
+2. Terraform bootstrap and lab, plus the Terraform CI job
+3. Budget change: track usage excluding credits
+
+## Milestone 2: AWS with Terraform
+
+### What was built
+
+Two Terraform projects, applied in order:
+
+| Project | Creates | State |
+|---|---|---|
+| `terraform/bootstrap` | One S3 bucket for Terraform state: encrypted (AES256), versioned, all public access blocked, `prevent_destroy` | Local file (git-ignored), backed up privately |
+| `terraform/lab` | VPC `10.42.0.0/16`, one public subnet, internet gateway and route, two security groups, key pair, two EC2 hosts, private backup bucket, backup IAM role and instance profile, monthly budget | Remote: the S3 state bucket, with native lock file (`use_lockfile`) |
+
+Inputs (`terraform.tfvars`, git-ignored): region, project name, admin IP (`/32`), SSH public key, backup bucket name, budget email, monthly budget, instance types. Outputs: `ci_public_ip`, `app_public_ip`, `app_private_ip`, `backup_bucket`.
+
+| Setting | Value |
 |---|---|
-| Helpdesk UI | http://localhost:8000 |
-| App metrics | http://localhost:8000/metrics |
-| Prometheus targets | http://localhost:9090/targets |
-| Prometheus alerts | http://localhost:9090/alerts |
-| Grafana | http://localhost:3000 |
+| Region | `eu-north-1` (Stockholm), the only region my free-plan project allows |
+| CI host | `t3.micro` (about 0.9 GiB RAM), Ubuntu 24.04 (`ami-084df9e6ad4622caf`), 50 GB encrypted gp3 |
+| App host | `t3.small` (about 1.9 GiB RAM), same image and disk |
+| Instance metadata | IMDSv2 required (`http_tokens = required`) |
+| Backup bucket | `gp-hd-backup-1126`: private, encrypted, objects under `backups/` expire after 14 days |
+| State bucket | `gp-hd-tform-state-1126` |
 
-Log into Grafana as `admin`, using `GRAFANA_ADMIN_PASSWORD` from `.env`. Open **Dashboards → DevOps Lab → RT Helpdesk**. The Prometheus datasource and dashboard are provisioned from files. Allow at least two scrapes for rates to appear. An error-rate panel showing zero with healthy traffic is expected.
+### What the backup IAM role allows
 
-Read [the monitoring lab](docs/MONITORING.md) for queries, alert exercises and Kubernetes requirements. Prometheus displays firing/resolved alerts. Email or chat notifications are not configured in this package.
+The app host's role can only: list the backup bucket under the `backups/` prefix, and upload (`PutObject`) and download (`GetObject`) objects under `backups/` in that one bucket. It cannot delete objects, touch other buckets, or manage any AWS infrastructure. This is why a stolen instance credential could not damage the rest of the account.
 
-## Tests
+### Commands (PowerShell, from `terraform/bootstrap` then `terraform/lab`)
 
-The following command uses a separate, disposable PostgreSQL test database. It does not test against the application's persistent database.
+```powershell
+$env:AWS_PROFILE = "rt-lab"          # profile created with: aws login --profile rt-lab --region eu-north-1
 
-```sh
-docker compose --profile test run --build --rm tests
-docker compose --profile test stop test-db
-docker compose --profile test rm -f test-db
+# bootstrap (once)
+terraform init
+terraform plan "-out=bootstrap.plan" "-var=region=eu-north-1" "-var=state_bucket=gp-hd-tform-state-1126"
+terraform apply "bootstrap.plan"
+
+# lab
+terraform init "-backend-config=backend.hcl"
+terraform fmt -recursive
+terraform validate
+terraform plan "-out=lab.plan"
+terraform apply "lab.plan"
+terraform output
 ```
 
-For local Python development, install Python 3.12 and run:
+### Results (expected vs actual)
 
-```sh
-python -m venv .venv
-# Linux/macOS: source .venv/bin/activate
-# Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-```
+| Step | Expected | Actual |
+|---|---|---|
+| Bootstrap plan and apply | 4 to add | 4 added |
+| Lab plan (reviewed line by line) | 18 to add, 0 destroy | 18 added |
+| Second `terraform plan` | No changes | "No changes. Your infrastructure matches the configuration." |
+| SSH to both hosts with my key | Login as `ubuntu` | Worked on both |
+| SSH from other IPs | Blocked | By security group (only `admin_cidr` allowed) |
+| Replace hosts after changing the SSH key | 3 to add, 3 to destroy | As expected; no other resource touched |
+| Budget change (`include_credit = false`) | 0 add, 1 change, 0 destroy | As expected |
 
-Without `RUN_DB_TESTS=1`, database integration tests explicitly skip. To run them against your own disposable PostgreSQL, set `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SSLMODE` and `RUN_DB_TESTS=1`. `DB_NAME` must end in `_test`; these tests clear its tickets table. The test user must be able to create the `helpdesk` schema. Do not use a shared or live database.
+Provider lock files (`.terraform.lock.hcl`, provider `hashicorp/aws` v6.72.0) are committed so everyone gets the same provider version.
 
-`.github/workflows/ci.yml` runs all tests with a PostgreSQL service on pull requests and `main`. It also builds the runtime image without pushing it. Enable the workflow after pushing the repository to GitHub, then require its check where your repository supports that feature. Otherwise record successful checks before merging. No independent PR approval is required for this individual project. Actions use version tags for readability; pin reviewed commit SHAs for a stronger supply-chain policy.
+### Budget, credits and cost estimate
 
-## Backup and restore locally
+- Account: AWS Free plan, **$100 credits** at the start, valid until **May 16, 2027**. Access to services ends when credits run out or the free period ends.
+- Budget: **$50 per month**, actual-spend email alert at 80% ($40). It tracks real usage (`include_credit = false`) so credits cannot hide spending. It only notifies; it does not stop resources.
+- I check Billing, Credits weekly.
 
-```sh
-python scripts/db_backup.py --output backups/lab.dump
-python scripts/db_restore.py backups/lab.dump --database helpdesk_restore_check1
-```
+Estimate for running both hosts 24/7 in `eu-north-1` (_rough numbers: confirm each line in the AWS Pricing Calculator before the assessment_):
 
-The backup uses `pg_dump` custom format. Restore only accepts a **new** name beginning with `helpdesk_restore_`. It does not overwrite the live database and fails if the destination already exists. It prints a restored row count. Compare actual ticket values as well before declaring recovery successful.
+| Item | Approx. per month |
+|---|---|
+| `t3.small` + `t3.micro` compute | ~$25 |
+| 2 x 50 GB gp3 encrypted disks | ~$8 |
+| 2 public IPv4 addresses | ~$7 |
+| S3 (state and backups, tiny) | under $1 |
+| **Total** | **~$40**, or ~$55 for the six weeks if never stopped |
 
-Remove the temporary restore database after inspection:
+Stopping an instance saves compute but not disk or IP costs, and the public IP changes when it starts again.
 
-```sh
-docker compose exec db dropdb -U postgres helpdesk_restore_check1
-```
+## Milestone 3: Linux and Kubernetes
 
-If a restore fails, the newly created test database is left in place for diagnosis. Drop that disposable database explicitly before retrying. Backup archives contain ticket data; keep them private.
+_Todo._
 
-## API and deployment contract
+## Milestone 4: Jenkins release and rollback
 
-See [API.md](docs/API.md) for requests and configuration. All web responses use port **8000**. Required paths are `/healthz`, `/readyz`, `/version` and `/metrics`.
+_Todo._
 
-Your runtime image must include Gunicorn, use UID/GID **10001**, write application logs to stdout and support a read-only root filesystem with writable `/tmp`. **Keep one Gunicorn worker per container** for correct metrics. Four threads serve requests; scale with Kubernetes replicas. Adding worker processes requires Prometheus multiprocess configuration that is not included here.
+## Milestone 5: Monitoring and restore
 
-Build an image with an identifiable version:
+_Todo._
 
-```sh
-docker build --target runtime --build-arg APP_VERSION=demo-v1 -t rt-helpdesk:demo-v1 .
-```
+## Cleanup and teardown
 
-In Jenkins, replace `demo-v1` with the exact checked-out Git commit SHA. Bake the version into the image and deploy the published image digest to the single `helpdesk` environment. `APP_ENV` is runtime configuration; normally do not override baked-in `APP_VERSION` in Kubernetes.
+Run only after the assessment and after keeping the evidence I need. Stopping instances is not cleanup.
 
-Before starting the app in a new Kubernetes environment, provision the database and `helpdesk` schema, then run the image once as a Job with:
+1. Copy any backups or evidence I want to keep, then empty the backup bucket (it has `force_destroy = false`, so a non-empty bucket blocks destroy):
+   ```powershell
+   aws s3 rm s3://gp-hd-backup-1126/ --recursive --profile rt-lab
+   ```
+2. From `terraform/lab`, review what will be removed, then destroy it:
+   ```powershell
+   terraform plan -destroy
+   terraform destroy
+   ```
+3. The state bucket is protected (`prevent_destroy`) and versioned. Only after the lab is destroyed: remove the `prevent_destroy` lifecycle line in `terraform/bootstrap/main.tf`, empty the bucket including all object versions, then run `terraform destroy` in `terraform/bootstrap`. Do not delete this bucket while resources still depend on it.
+4. Verify in the AWS console and with the CLI that nothing remains: EC2 instances, EBS volumes, public IPv4 addresses, security groups, VPC, S3 buckets, IAM roles and the budget.
+5. Check Billing for the next days to confirm no new charges.
 
-```sh
-flask --app app init-db
-```
+## Problems met and how they were solved
 
-The initialization retries temporary connection failures up to ten times. `schema.sql` is the initial schema, not a general migration framework. App restarts do not execute DDL.
-
-## Versions and verification
-
-Python dependencies are pinned in `requirements.txt` and `requirements-dev.txt`. PostgreSQL uses the maintained `16-bookworm` tag; Python uses `3.12-slim-bookworm`. These tags can receive updates. Record resolved digests in your release evidence. Prometheus and Grafana use explicit versions in Compose. Review and scan versions before running a class.
-
-See [VALIDATION.md](docs/VALIDATION.md) for what was actually executed while preparing this package and what still requires a Docker/AWS environment.
+| Problem | Cause | Fix |
+|---|---|---|
+| First `terraform apply` failed creating a bucket: explicit deny in a service control policy | My AWS account belonged to an organization that blocks regions; the free-plan project allows only one region | Learned the project region (`eu-north-1`) from the sign-in page and used it everywhere |
+| CLI error "login session has expired" | `aws login` sessions are short-lived | `aws login --profile rt-lab --region eu-north-1` again |
+| `terraform plan -out=x.plan` gave "Too many command line arguments" | PowerShell 5.1 splits arguments at the dot | Quote the option: `"-out=x.plan"` |
+| Lost the passphrase of my first SSH key | A passphrase cannot be recovered | New key pair, then `terraform apply -replace=...` for both (still empty) hosts |
+| Git Bash rewrote `/tmp` in a Docker command | MSYS path conversion | Prefix the command with `MSYS_NO_PATHCONV=1` |
+| First CI run on `main` failed | `main` had no Dockerfile yet | The Dockerfile PR fixed it |
