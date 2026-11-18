@@ -4,7 +4,7 @@ Individual DevOps final project: deploy and operate the supplied RT Helpdesk (Fl
 
 The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_README.md).
 
-**Status:** Milestones 1-2 done. Milestones 3-5 are placeholders.
+**Status:** Milestones 1-3 done. Milestones 4-5 are placeholders.
 
 ## Contents
 
@@ -12,7 +12,7 @@ The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_R
 2. [Ports and access](#ports-and-access)
 3. [Milestone 1: Container packaging, Git and CI](#milestone-1-container-packaging-git-and-ci)
 4. [Milestone 2: AWS with Terraform](#milestone-2-aws-with-terraform)
-5. [Milestone 3: Linux and Kubernetes](#milestone-3-linux-and-kubernetes) (todo)
+5. [Milestone 3: Linux and Kubernetes](#milestone-3-linux-and-kubernetes)
 6. [Milestone 4: Jenkins release and rollback](#milestone-4-jenkins-release-and-rollback) (todo)
 7. [Milestone 5: Monitoring and restore](#milestone-5-monitoring-and-restore) (todo)
 8. [Cleanup and teardown](#cleanup-and-teardown)
@@ -33,7 +33,7 @@ flowchart LR
     state[("S3 state bucket<br/>gp-hd-tform-state-1126")] -. "Terraform state" .- me
 ```
 
-Built so far: everything in the diagram except what runs on the hosts (Milestones 3-5).
+Built so far: the AWS infrastructure, both hosts, the kind cluster and the app on the app host (Milestone 3). Jenkins is installed on the CI host but not yet configured (Milestone 4); monitoring and the S3 backup/restore are Milestone 5.
 
 **Known limits.** One app host and one database mean there is no high availability. The kind cluster uses local volumes, which are lost if the cluster (or host) is deleted. Recovery therefore relies on the S3 backups. No load balancer, domain, HTTPS, EKS, RDS or NAT gateway is used, by design (cost and scope).
 
@@ -197,7 +197,107 @@ Stopping an instance saves compute but not disk or IP costs, and the public IP c
 
 ## Milestone 3: Linux and Kubernetes
 
-_Todo._
+Both hosts were configured over SSH with the supplied bootstrap script (`reference/linux/bootstrap-ubuntu.sh`), run from a clone of this repository in `/opt/rt-helpdesk`. The app was then deployed to a kind cluster with the supplied manifests and helper scripts. The supplied manifests were used **unchanged** (the script only substitutes the image reference).
+
+### Tool versions
+
+| Item | Version |
+|---|---|
+| OS | Ubuntu 24.04.5 LTS, kernel 7.0.0-1017-aws |
+| Docker / Compose (distro packages) | 29.1.3 / 2.40.3 |
+| kind | v0.33.0 (checksum verified by the script) |
+| kubectl | v1.34.13 (checksum verified by the script) |
+| Kubernetes node image | `kindest/node:v1.34.0` (pinned with `--image`) |
+| AWS CLI (app host) | 2.41.0, installed from Amazon's official installer |
+| Jenkins (CI host) | 2.580.2 LTS, package held with `apt-mark hold` |
+| Java (CI host) | OpenJDK 21 JRE (distro package) |
+
+### Host preparation
+
+- **Swap:** both hosts had no swap, and the CI host has only about 0.9 GB of RAM. I added a 2 GB swap file (`fallocate`, `chmod 600`, `mkswap`, `swapon`, plus an `/etc/fstab` line) so memory pressure slows things down instead of the kernel killing processes. A reboot confirmed it survives restarts. It is slow compared with RAM, so it is a safety net, not capacity.
+- **Jenkins heap limit:** a systemd drop-in (`/etc/systemd/system/jenkins.service.d/override.conf`) sets `JAVA_OPTS` with `-Xms128m -Xmx384m`. A drop-in survives package upgrades; editing the unit file would not. Verified in the running process arguments.
+- **Inspection:** `systemctl is-active docker jenkins` (both `active`), `systemctl status jenkins`, and `journalctl -u jenkins` (log shows "Jenkins is fully up and running").
+- **SSH:** I log in with an ed25519 key pair (the private key stays on my PC and is never committed); port 22 is limited by security group, see [Ports and access](#ports-and-access). The app is reached with `-L 8001:...` (local port 8001, to avoid clashing with the local Compose copy on 8000).
+
+### Linux users
+
+| User | Host | Purpose | Sudo | Docker group |
+|---|---|---|---|---|
+| `ubuntu` | both | Administration over SSH | yes | yes |
+| `buildagent` | CI | Runs Jenkins builds (agent set up in Milestone 4); needs Docker to build images | no | yes |
+| `deploy` | app | Release identity: holds a namespace-limited Kubernetes kubeconfig and nothing else | **no** | **no** |
+
+Docker-group membership is effectively root on the host, so it is given only to the accounts that need it. `deploy` was verified: `sudo -l -U deploy` reports no sudo rights and `docker ps` as `deploy` is denied.
+
+### Image used for the first deployment
+
+Built from commit `2181d9dac3ecd476afce05e23f594d08bd489010` on `main` with `APP_VERSION` set to that SHA, pushed to a public GHCR package, and deployed **by digest** so the exact bytes are fixed:
+
+`ghcr.io/gal-peter/rt-helpdesk@sha256:ce5c3a75e9fb2a253532222f9cbde7e5b67d42bae35cf9814c97dc3f6d975d87`
+
+An anonymous `docker pull` of that digest on the app host succeeded (so the package is public), and `printenv APP_VERSION` in the container prints the commit SHA. The same SHA is shown in the app's UI header.
+
+The package is public so Kubernetes needs no image pull secret. The image holds only application code (already public in this repo); all credentials are injected at runtime from Kubernetes Secrets.
+
+### kind cluster
+
+`kind create cluster --name helpdesk --config reference/k8s/kind.yaml --image kindest/node:v1.34.0`: one control-plane node, API server bound to `127.0.0.1:6443` (not reachable from the network). Default StorageClass `standard` (local-path provisioner, reclaim policy `Delete`).
+
+### Kubernetes resources (namespace `helpdesk`)
+
+| Resource | Name | What it does and why |
+|---|---|---|
+| ConfigMap | `app-config` | Non-secret settings: DB host/port/name/user, `DB_SSLMODE`. `APP_ENV` is patched in by the bootstrap script |
+| Secret (created outside Git) | `app-secret`, `db-secret` | Random DB passwords generated at bootstrap time by the script; never written to Git or the image |
+| ConfigMap | `db-init` | Init script that creates the non-superuser `helpdesk_app` role and the `helpdesk` schema when PostgreSQL first initializes an empty volume |
+| StatefulSet + headless Service | `db` | One PostgreSQL 16 pod with a stable name (`db-0`); the headless Service gives it a stable DNS name. `pg_isready` readiness probe; requests 100m CPU / 256 Mi, limits 1 CPU / 512 Mi |
+| PVC (from `volumeClaimTemplates`) | `data-db-0` | 2 Gi volume for the database; survives pod restarts |
+| Job | `init-db` | One-time `flask --app app init-db` that creates the tables; retries up to 3 times, 180 s deadline. Not run on every API start |
+| Deployment | `api` | 1 replica of the app. Non-root (UID/GID 10001), `readOnlyRootFilesystem`, all capabilities dropped, no privilege escalation, `RuntimeDefault` seccomp, writable `emptyDir` on `/tmp`. Requests 100m / 128 Mi, limits 500m / 256 Mi |
+| Probes (on `api`) | | `startupProbe` and `livenessProbe` on `/healthz`; `readinessProbe` on `/readyz`, so a pod is only sent traffic when the app and database are ready |
+| Service | `api` | ClusterIP on port 8000; reached only through `kubectl port-forward` over an SSH tunnel |
+| ServiceAccount, Role, RoleBinding | `jenkins-release` | The release identity (below) |
+
+Neither the API pod nor the DB pod mounts a service-account token (`automountServiceAccountToken: false`).
+
+### Release identity (least privilege)
+
+`jenkins-release` may only `get`/`watch`/`patch` the Deployment named `api`, `get`/`list` pods, and `create` on `pods/exec` (for the smoke test), all inside `helpdesk`. `reference/scripts/issue-release-kubeconfigs.sh` issues a token valid for 24 hours and writes a kubeconfig to `/home/deploy/.kube/helpdesk` (owner `deploy`, mode 600). **Credentials must be refreshed by re-running that script when they expire.** Cluster-admin credentials are never used by Jenkins.
+
+Tests run as `deploy` with that kubeconfig:
+
+| Command | Result |
+|---|---|
+| `kubectl get pods` | works |
+| `kubectl get secrets` | `Forbidden` (cannot list secrets) |
+| `kubectl -n kube-system get pods` | `Forbidden` |
+| `docker ps` | permission denied |
+
+### Acceptance checks (2026-11-18)
+
+| Check | Expected | Actual |
+|---|---|---|
+| Open the app through the tunnel | UI with five seeded tickets | `ssh -L 8001:127.0.0.1:8000` plus `kubectl port-forward service/api 8000:8000`; UI shown at `localhost:8001` with the build SHA in the header |
+| Create a ticket | New ticket appears | Ticket #6 (fictional data) created |
+| Delete the API pod | A new pod replaces it | Pod `api-55686d6f84-nz8st` deleted; `api-55686d6f84-z7bm7` was `1/1 Running` 14 s later |
+| Restart the DB pod with the same PVC | Ticket still there | `db-0` deleted and recreated (PVC `data-db-0` unchanged); ticket #6 still present |
+| Diagnose a wrong configuration | Cause found with logs and `describe` | See below |
+
+**Diagnosis exercise.** I set the Deployment image to a tag that does not exist (`kubectl set image deployment/api api=ghcr.io/gal-peter/rt-helpdesk:does-not-exist`). The new pod went to `ErrImagePull` while the old pod stayed `1/1 Running`, because a rolling update only removes the old pod after the new one is ready. `kubectl describe pod` showed the failed image pull in the Events section; `kubectl logs` only said the container was "waiting to start: trying and failing to pull image", because the app never ran. I recovered with `kubectl rollout undo deployment/api` and confirmed one healthy `1/1` pod.
+
+### Limits
+
+- One API replica and one database pod; no high availability. The scaling exercise was not done.
+- The PVC lives in kind's local storage on the app host. Deleting the kind cluster or the host loses the data, even though the manifests contain a PVC; recovery relies on the S3 backup (Milestone 5).
+- Release credentials expire after about 24 hours and must be re-issued.
+
+### Problems met and how they were solved
+
+| Problem | Cause | Fix |
+|---|---|---|
+| Bootstrap script stopped on the app host: `Package 'awscli' has no installation candidate` | Ubuntu 24.04 no longer has an `awscli` apt package, and the script uses `set -e` | Everything before that line (Docker, kind, kubectl, `deploy` user) had already run; I installed AWS CLI v2 from Amazon's official zip installer |
+| `docker push` ended with `error from registry: denied` | Not diagnosed; all layers uploaded, and the package then appeared as **Private** | Made the GHCR package public in its settings, then verified an anonymous pull of the digest from the app host |
+| `kubectl logs` showed nothing useful for the broken pod | The container never started | Used `kubectl describe pod` Events for image-pull errors |
 
 ## Milestone 4: Jenkins release and rollback
 
