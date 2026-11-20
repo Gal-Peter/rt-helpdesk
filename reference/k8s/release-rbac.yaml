@@ -16,6 +16,7 @@ rules:
   - api
   verbs:
   - get
+  - list
   - watch
   - patch
 - apiGroups:
