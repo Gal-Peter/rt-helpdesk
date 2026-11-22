@@ -4,7 +4,7 @@ Individual DevOps final project: deploy and operate the supplied RT Helpdesk (Fl
 
 The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_README.md).
 
-**Status:** Milestones 1-3 done. Milestones 4-5 are placeholders.
+**Status:** Milestones 1-4 done. Milestone 5 is a placeholder.
 
 ## Contents
 
@@ -13,7 +13,7 @@ The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_R
 3. [Milestone 1: Container packaging, Git and CI](#milestone-1-container-packaging-git-and-ci)
 4. [Milestone 2: AWS with Terraform](#milestone-2-aws-with-terraform)
 5. [Milestone 3: Linux and Kubernetes](#milestone-3-linux-and-kubernetes)
-6. [Milestone 4: Jenkins release and rollback](#milestone-4-jenkins-release-and-rollback) (todo)
+6. [Milestone 4: Jenkins release and rollback](#milestone-4-jenkins-release-and-rollback)
 7. [Milestone 5: Monitoring and restore](#milestone-5-monitoring-and-restore) (todo)
 8. [Cleanup and teardown](#cleanup-and-teardown)
 9. [Problems met and how they were solved](#problems-met-and-how-they-were-solved)
@@ -33,7 +33,7 @@ flowchart LR
     state[("S3 state bucket<br/>gp-hd-tform-state-1126")] -. "Terraform state" .- me
 ```
 
-Built so far: the AWS infrastructure, both hosts, the kind cluster and the app on the app host (Milestone 3). Jenkins is installed on the CI host but not yet configured (Milestone 4); monitoring and the S3 backup/restore are Milestone 5.
+Built so far: the AWS infrastructure, both hosts, the kind cluster and the app on the app host (Milestone 3), and a Jenkins pipeline that tests, builds, publishes and deploys the app, with automatic rollback (Milestone 4). Monitoring and the S3 backup/restore are Milestone 5.
 
 **Known limits.** One app host and one database mean there is no high availability. The kind cluster uses local volumes, which are lost if the cluster (or host) is deleted. Recovery therefore relies on the S3 backups. No load balancer, domain, HTTPS, EKS, RDS or NAT gateway is used, by design (cost and scope).
 
@@ -301,7 +301,63 @@ Tests run as `deploy` with that kubeconfig:
 
 ## Milestone 4: Jenkins release and rollback
 
-_Todo._
+Jenkins builds, tests, publishes and deploys the app from `main`. The pipeline is the supplied `reference/Jenkinsfile`; I changed only its three environment values (registry repository, registry host, app host address), through a reviewed pull request.
+
+### Setup
+
+| Item | Choice |
+|---|---|
+| Jenkins | 2.580.2 LTS on the CI host, package held with `apt-mark hold`, heap capped at 384 MB (see Milestone 3) |
+| Controller | **0 executors**: no build ever runs on the controller |
+| Build agent | SSH agent `helpdesk-build` (label `helpdesk-build`) on the same host, as the unprivileged user `buildagent` (Docker group, no sudo). Its SSH host key was trusted once, when the node was first connected |
+| Access to the UI | Only through an SSH tunnel (`-L 8081:127.0.0.1:8080`); port 8080 is not open to the internet |
+| Job | `helpdesk-release`: *Pipeline script from SCM*, public repo, branch `*/main`, script path `reference/Jenkinsfile` |
+
+### Credentials (kept in the Jenkins store, never in Git)
+
+| ID | Type | Used for |
+|---|---|---|
+| `buildagent-ssh` | SSH private key | Controller connects to the build agent |
+| `registry-push` | Username and token | `docker push` to GHCR, only inside the publish stage |
+| `app-deploy-ssh` | SSH private key (user `deploy`) | Release step connects to the app host |
+| `app-known-hosts` | Secret file | `known_hosts` for the app host; the deploy SSH uses `StrictHostKeyChecking=yes` |
+
+The deploy key is restricted on the app host (`authorized_keys` entry with `from=` the CI host's address and `restrict`), and the `deploy` user has no sudo, no Docker group and a namespace-limited kubeconfig. Credentials are used only in the stages that need them, and the pipeline runs `set +x` around them so they are not echoed.
+
+### Pipeline stages
+
+1. **Checkout trusted main**: checks out the repo and fails unless `HEAD` equals `origin/main`.
+2. **Required checks on this SHA**: re-runs the tests (`docker compose --profile test run --build --rm tests`) against an isolated PostgreSQL. The pipeline does not trust a status it did not verify itself.
+3. **Build image**: `docker build --target runtime` with `APP_VERSION` set to the commit SHA.
+4. **Publish immutable release**: pushes the SHA-tagged image to GHCR with a temporary Docker config and records its **digest** in `release-image.txt` (archived).
+5. **Deploy and verify**: over SSH as `deploy`, `reference/scripts/release.sh` sets the Deployment to the **digest**, waits for the rollout, checks every pod's `/version` equals the commit SHA and `/readyz` is 200, then creates and reads a ticket through the Service. If any step fails, an `ERR` trap restores the previous image.
+
+`disableConcurrentBuilds`, a 45-minute timeout and 15 kept builds protect a host with under 1 GB of RAM. A `post` block always tears down the test containers and deletes the workspace.
+
+### Results
+
+| Build | Commit | Result | What happened |
+|---|---|---|---|
+| #1 | `3158ae1` | **Failed, rolled back** | Tests, build and push passed. `kubectl rollout status` was forbidden (see Problems), timed out after 180 s, the rollback trap restored the previous image. The app kept serving from the old pod |
+| #2 | `7fa71c0` | **Success** | Tests 36 passed; digest `sha256:7b6cffbc94d7aae6ff126aa9efe0a67bd04fefe78675e282f804b8bde7c7412b`; rollout completed; `Verified helpdesk at 7fa71c06…`. The Deployment's image is that digest |
+
+**Controlled bad release.** I ran the same `release.sh`, as the same `deploy` user, with a well-formed image digest that does not exist (64 zeros). The new pod went `ErrImagePull` / `ImagePullBackOff` while the old pod stayed `1/1 Running`. After the 180 s timeout the script printed `Release failed; restoring previous image`, set the previous digest back and reported `successfully rolled out`. Afterwards the Deployment showed the build #2 digest again and one healthy pod.
+
+Evidence kept with the submission: console output of builds #1 and #2, `release-image.txt`, screenshots of the credentials list (IDs only), node status and the rollback test, and the `kubectl` outputs above.
+
+### Problems met and how they were solved
+
+| Problem | Cause | Fix |
+|---|---|---|
+| Build #1 deploy stage hung and then rolled back: `cannot list resource "deployments"... forbidden` | The supplied Role gave `jenkins-release` only `get`, `watch` and `patch` on the `api` Deployment, and `kubectl rollout status` also needs `list` | Added one line, `list`, to the Deployment rule in `reference/k8s/release-rbac.yaml` via a pull request. The rule still has `resourceNames: [api]`, so Jenkins cannot list or change any other Deployment. Applied with `kubectl apply`; `kubectl auth can-i list deployments.apps/api --as=…` gives `yes`, and for all Deployments `no` |
+| A secret-file credential was created with a random ID | The ID field was left blank | Deleted it and recreated it with the ID `app-known-hosts`, which the Jenkinsfile expects |
+
+### Limits
+
+- The bad-release test ran `release.sh` directly, not through a Jenkins build, so that a deliberately broken commit would not enter `main`. It tests the same script and identity the pipeline uses.
+- Release credentials last 24 hours; before a release on a later day, run `reference/scripts/issue-release-kubeconfigs.sh` on the app host again.
+- Docker warns that BuildKit/buildx is not installed and uses the legacy builder. It works; installing buildx would be an improvement.
+- One agent, one executor: builds are queued, not parallel.
 
 ## Milestone 5: Monitoring and restore
 
