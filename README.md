@@ -4,7 +4,7 @@ Individual DevOps final project: deploy and operate the supplied RT Helpdesk (Fl
 
 The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_README.md).
 
-**Status:** Milestones 1-4 done. Milestone 5 is a placeholder.
+**Status:** Milestones 1-5 done.
 
 ## Contents
 
@@ -14,7 +14,7 @@ The original package README is kept at [docs/SUPPLIED_README.md](docs/SUPPLIED_R
 4. [Milestone 2: AWS with Terraform](#milestone-2-aws-with-terraform)
 5. [Milestone 3: Linux and Kubernetes](#milestone-3-linux-and-kubernetes)
 6. [Milestone 4: Jenkins release and rollback](#milestone-4-jenkins-release-and-rollback)
-7. [Milestone 5: Monitoring and restore](#milestone-5-monitoring-and-restore) (todo)
+7. [Milestone 5: Monitoring and restore](#milestone-5-monitoring-and-restore)
 8. [Cleanup and teardown](#cleanup-and-teardown)
 9. [Problems met and how they were solved](#problems-met-and-how-they-were-solved)
 
@@ -33,7 +33,7 @@ flowchart LR
     state[("S3 state bucket<br/>gp-hd-tform-state-1126")] -. "Terraform state" .- me
 ```
 
-Built so far: the AWS infrastructure, both hosts, the kind cluster and the app on the app host (Milestone 3), and a Jenkins pipeline that tests, builds, publishes and deploys the app, with automatic rollback (Milestone 4). Monitoring and the S3 backup/restore are Milestone 5.
+Built so far: the AWS infrastructure, both hosts, the kind cluster and the app on the app host (Milestone 3), a Jenkins pipeline that tests, builds, publishes and deploys the app, with automatic rollback (Milestone 4), and Prometheus and Grafana monitoring with a database-down alert and a verified S3 backup restore (Milestone 5).
 
 **Known limits.** One app host and one database mean there is no high availability. The kind cluster uses local volumes, which are lost if the cluster (or host) is deleted. Recovery therefore relies on the S3 backups. No load balancer, domain, HTTPS, EKS, RDS or NAT gateway is used, by design (cost and scope).
 
@@ -361,7 +361,66 @@ Evidence kept with the submission: console output of builds #1 and #2, `release-
 
 ## Milestone 5: Monitoring and restore
 
-_Todo._
+Prometheus and Grafana run in the `monitoring` namespace of the kind cluster, deployed with the supplied script and manifests (`reference/scripts/bootstrap-monitoring.sh`, `reference/k8s/monitoring.yaml`). Scrape config, alert rule and dashboard JSON are in Git (`reference/k8s/prometheus.yml`, `alerts.yml`, `helpdesk-dashboard.json`) and are loaded into ConfigMaps by the script. The Grafana admin password is entered at deploy time (at least 16 characters, hidden) and stored only in a Kubernetes Secret.
+
+### Access
+
+| What | How | Port exposed to the internet |
+|---|---|---|
+| Grafana | `ssh -L 3001:127.0.0.1:3000` to the app host, then `kubectl -n monitoring port-forward service/grafana 3000:3000`; browse `http://localhost:3001` | none |
+| Prometheus | `ssh -L 9091:127.0.0.1:9090`, then `kubectl -n monitoring port-forward service/prometheus 9090:9090`; browse `http://localhost:9091` | none |
+
+### How Prometheus finds the app
+
+Kubernetes service discovery (`role: pod`, limited to the `helpdesk` namespace). Only pods labelled `app=api`, in phase `Running`, with a container port named `http` are scraped. The supplied Role lets the `prometheus` ServiceAccount read pods in that namespace only. Scrape interval is 15 s.
+
+Check: `up{job="helpdesk"}` returned one series (the API pod) with value `1`.
+
+### Dashboard: three panels
+
+| Panel | Query (supplied) | What it tells me |
+|---|---|---|
+| Reachable targets | `sum(up{job="helpdesk",environment="helpdesk"})` | How many app pods Prometheus can scrape. `1` means the one API pod is reachable |
+| API requests per second | `sum(rate(helpdesk_http_requests_total{...,route=~"/api/.*"}[5m]))` | Traffic reaching the API, averaged over 5 minutes |
+| API 5xx percentage | 5xx request rate divided by total request rate, times 100 | Share of API requests that failed on the server side |
+
+I generated load with the supplied `scripts/traffic.py --seconds 180` (read-only GETs, about four per second) through a port-forward to the `api` Service. The panels showed "No data" for the two request panels before traffic, then the request rate rose toward the generated rate and the 5xx percentage stayed at 0 %, because no request failed.
+
+### Alert: database unavailable
+
+Rule `HelpdeskDatabaseUnavailable`: `helpdesk_database_up{job="helpdesk"} == 0`, `for: 1m`, severity `critical`. No notification channel is configured; the state is read in the Prometheus UI.
+
+| Step | Command | Expected | Actual |
+|---|---|---|---|
+| Baseline | open `/alerts` | rule Inactive | Inactive |
+| Stop the database (2026-11-23 23:26:36 UTC) | `kubectl -n helpdesk scale statefulset/db --replicas=0` | `db-0` stops, PVC stays | `db-0` gone, `data-db-0` kept; the `api` pod became `0/1 Running` with no new restarts |
+| Wait | refresh `/alerts` | Pending, then Firing after 1 minute of failures | **Firing**, value 0, "Active since 3m 43s" in my screenshot |
+| Restart the database | `kubectl -n helpdesk scale statefulset/db --replicas=1` | `db-0` returns with the same data, API becomes ready | `db-0` `1/1`, `api` `1/1`, all 7 tickets still present |
+| Recovery | refresh `/alerts` | Inactive again | **Inactive** |
+
+**Liveness vs readiness.** `/healthz` (liveness) only says the process is alive, so it stayed healthy and Kubernetes did not restart the pod. `/readyz` (readiness) checks the database, so it failed and the pod was removed from the Service. Restarting the app would not bring the database back, so keeping the pod and failing readiness is the right behaviour.
+
+### Backup to S3 and verified restore
+
+| Step | Command | Result |
+|---|---|---|
+| Record tickets before | `psql ... -c 'SELECT id,title,status FROM helpdesk.tickets ORDER BY id;'` into a file | 7 tickets |
+| Backup and upload | `bash reference/scripts/k8s-backup.sh helpdesk <backup bucket>` | `Backup uploaded: backups/helpdesk/20261123T233945Z.dump` |
+| Confirm in S3 | `aws s3 ls s3://<backup bucket>/backups/helpdesk/` | one object, 4446 bytes |
+| Download | `aws s3 cp s3://<backup bucket>/backups/helpdesk/20261123T233945Z.dump restored.dump` | file of the same size |
+| Restore into a new database | `createdb ... helpdesk_restore_check1`, then `pg_restore --no-owner --no-privileges --exit-on-error` | no errors |
+| Compare | `SELECT id,title,status ...` on the restored database, `diff` with the saved list | **IDENTICAL** (7 rows, including the Hebrew-titled ticket) |
+| Clean up | `dropdb ... helpdesk_restore_check1`, `rm restored.dump` | only `helpdesk`, `postgres` and the templates remain; live `helpdesk` still has 7 tickets |
+
+The backup uses the EC2 instance role (no access keys on the host). The role can write backups but not delete them, the bucket is private, and objects expire after 14 days. The restore never touched the application's database.
+
+### Limits
+
+- One API replica and one database pod. The alert detects an outage; it does not prevent one.
+- Prometheus and Grafana data and the database volume live in kind's local storage on one host. Deleting the cluster or the host loses them; the S3 backup is the recovery path for the tickets (dashboards and rules are in Git).
+- The backup is manual, not scheduled (the scheduled extension is optional).
+- The restore test ran inside the same PostgreSQL server (a new database next to the live one), not on a fresh server. That proves the dump is valid and complete; a full disaster recovery would also rebuild the cluster and database pod first.
+- The alert has no email or chat notification.
 
 ## Cleanup and teardown
 
